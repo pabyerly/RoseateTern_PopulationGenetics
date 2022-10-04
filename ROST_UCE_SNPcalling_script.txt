@@ -1,0 +1,280 @@
+
+#Byerly, Paige 2022
+
+#code based on: https://github.com/SmithsonianWorkshops/Targeted_Enrichment/blob/master/phyluce.md
+
+##################################################################################################
+#start with:clean raw fast1 files
+#Note: took out "_001" from fastq file names. Not necessary, just make sure pattern specification and name match
+#Not working? check for quotation marks in conf file, etc. Super sensitive. 
+
+# ----------------Modules------------------------- #
+module load bioinformatics/phyluce/1.5_tg
+#
+# ----------------Your Commands------------------- #
+#
+echo + `date` job $JOB_NAME started in $QUEUE with jobID=$JOB_ID on $HOSTNAME
+echo + NSLOTS = $NSLOTS
+#
+illumiprocessor --input /pool/genomics/byerlyp/raw-fastq/00_fastq \
+--output /pool/genomics/byerlyp/clean-fastq \
+--config illumiprocessor.conf \
+--paired \
+--r1-pattern {}_R1.fastq \
+--r2-pattern {}_R2.fastq \
+--cores $NSLOTS 
+#
+echo = `date` job $JOB_NAME done
+
+#Afterwards, get an idea of how trimming did with interactive job: 
+
+cd clean-fastq
+qrsh
+module load bioinformatics/phyluce
+cd /pool/genomics/byerlyp/clean-fastq
+for i in *;
+do 
+phyluce_assembly_get_fastq_lengths --input $i/split-adapter-quality-trimmed/
+--csv;
+done 
+
+#see clean_fastq_output.txt
+###################################################################################################################
+
+#next: assembly of reference file (FL 1843)
+#Make sure to give enough memory or job gets killed 
+
+# ----------------Modules------------------------- #
+module load bioinformatics/phyluce
+#
+# ----------------Your Commands------------------- #
+#
+echo + `date` job $JOB_NAME started in $QUEUE with jobID=$JOB_ID on $HOSTNAME
+echo + NSLOTS = $NSLOTS
+#
+phyluce_assembly_assemblo_trinity --conf /pool/genomics/byerlyp/jobs_conf/assembly.conf \
+--output trinity-assembly 
+#
+echo = `date` job $JOB_NAME done
+
+##############################################################
+
+#get fasta lengths
+
+qrsh
+module load bioinformatics/phyluce
+for i in /pool/genomics/byerlyp/trinity-assembly/contigs/FL1843.contigs.fasta;
+do phyluce_assembly_get_fasta_lengths --input $i --csv;
+done
+
+##############################################################
+
+#match contigs with probes
+
+qrsh
+phyluce_assembly_match_contigs_to_probes --contigs /pool/genomics/byerlyp/trinity-assembly/contigs \
+--probes /pool/genomics/byerlyp/uce-5k-probes.fasta \
+--output /pool/genomics/byerlyp/uce-search-results
+#
+echo = `date` job $JOB_NAME done
+
+
+############################################################
+
+#match counts
+
+#IMPORTANT: make directory:
+
+mkdir -p taxon-sets/all
+
+
+#complete matrix 
+qrsh
+phyluce_assembly_get_match_counts --locus-db /pool/genomics/byerlyp/uce-search-results/probe.matches.sqlite \
+--taxon-list-config taxon-set.conf \
+--taxon-group 'all' \
+--output taxon-sets/all/FL1843.conf
+
+
+############################################################
+
+#output fasta files
+# change to the taxon-sets/all directory
+cd taxon-sets/all
+
+# make a log directory to hold our log files - this keeps things neat
+mkdir log
+
+phyluce_assembly_get_fastas_from_match_counts --contigs /pool/genomics/byerlyp/trinity-assembly/contigs \
+--locus-db /pool/genomics/byerlyp/uce-search-results/probe.matches.sqlite \
+--match-count-output /pool/genomics/byerlyp/taxon-sets/all/FL1843.conf \
+--output FL1843-complete.fasta \
+--log-path log
+
+
+############################################################
+
+#Get summary stats on FASTA: (note: this gets really picky about placement of —csv command!)
+
+
+for i in taxon-sets/all/*.fasta;
+do phyluce_assembly_get_fasta_lengths --input $i 
+done
+
+Reads:          4,532
+Bp:             3,302,913
+Avg. len:       728.798102383
+STDERR len:     2.2733354644
+Min. len:       202
+Max. len:       4,188
+Median len:     744.0
+Contigs > 1kb:  71
+
+############################################################
+
+#BWA Alignment
+
+#Input: clean raw reads for each sample 
+#output: multi-aligned bams files for each sample
+
+#note: this takes awhile! And uses a lot of memory. 
+
+#
+# ----------------Modules------------------------- #
+module load bioinformatics/phyluce
+#
+# ----------------Your Commands------------------- #
+#
+phyluce_snp_bwa_align \
+--config /pool/genomics/byerlyp/jobs_conf/alignment.conf \
+--output /pool/genomics/byerlyp/aligned_bams_mem \
+--cores 8 \
+--log-path /pool/genomics/byerlyp/taxon-sets/all/log \
+--verbosity WARN \
+--no-remove-duplicates \
+--mem
+#
+echo = `date` job $JOB_NAME done
+
+
+#output structure: MASS1706-CL-RG-M.bam 
+
+****************************
+#conf file structure 
+
+[reference]
+/pool/genomics/byerlyp/SNP_assembly/trinity-assembly/FL1843.fasta
+
+[individuals]
+AMNH325486:/work/pabyerly/clean-fastq/AMNH325486/AMNH325486/split-adapter-quality-trimmed/
+
+[flowcell]
+AMNH325486:XXXXXX
+****************************
+#note: may need to split into sections if phyluce won't process all
+
+##################################################################################################################
+
+#Call SNPs for INDIVIDUAL BAMS
+
+#
+# ----------------Modules------------------------- #
+module load bioinformatics/gatk/4.1.3.0
+#
+# ----------------Your Commands------------------- #
+#
+echo + `date` job $JOB_NAME started in $QUEUE with jobID=$JOB_ID on $HOSTNAME
+echo + NSLOTS = $NSLOTS
+#
+rungatk HaplotypeCaller \
+-R /pool/genomics/byerlyp/SNP_assembly/taxon-sets/all/FL1843-complete.fasta \
+-I /pool/genomics/byerlyp/SNP_assembly/merged_bams/merged_all.bam \
+--native-pair-hmm-threads 20 \
+-O /pool/genomics/byerlyp/SNP_assembly/SNPs_all_raw.vcf.gz 
+#
+echo = `date` job $JOB_NAME done
+
+
+#11 create a dictionary from ref contigs
+
+#input: reference.fasta
+#output: reference.dic 
+
+module load bioinformatics/picard-tools
+runpicard CreateSequenceDictionary \
+REFERENCE=/pool/genomics/byerlyp/taxon-sets/all/FL1843-complete.fasta \
+OUTPUT=/pool/genomics/byerlyp/taxon-sets/all/FL1843-complete.dict
+
+##################################################################################################################
+
+#index the reference 
+
+#input/output: reference.fasta
+
+samtools faidx /pool/genomics/byerlyp/taxon-sets/all/FL1843-complete.fasta
+
+#output: final vcf.gz 
+
+###################################################################################################################
+
+#filtering 
+
+qrsh
+module load bioinformatics/vcftools
+cd /pool/genomics/byerlyp/SNP_assembly/SNPs
+
+#check % missing data: 
+vcftools --gzvcf SNPs_modern_raw.vcf.gz \
+--missing-indv 
+--recode \
+--recode-INFO-all \
+--out modern_snps_raw_filter_missing
+
+#REMOVE INDIVIDUALS >40% MISSING DATA 
+vcftools --gzvcf SNPs_modern_raw.vcf.gz \
+--remove-indv AZ1801 \
+--remove-indv AZ1802 \
+--remove-indv AZ1808 \
+--remove-indv FL1858 \
+--remove-indv USVI1851 \
+--recode \
+--recode-INFO-all \
+--out modern_snps_indv
+
+
+#remove indels, filter to minimum read depth >5, SNP quality score >30, 
+#minor allele count >3:
+vcftools --gzvcf modern_snps_indv.recode.vcf \
+--min-meanDP 5 \
+--max-meanDP 100 \
+--maf 0.03 \
+--minQ 30 \
+--remove-indels \
+--recode \
+--recode-INFO-all \
+--out SNPs_modern_filter
+
+#filter by 90
+vcftools --gzvcf SNPs_modern_filter.recode.vcf \
+--max-missing 0.9 \
+--recode \
+--recode-INFO-all \
+--out SNPs_modern_filter_90
+
+#thin to 1 SNP per locus 
+vcftools --gzvcf SNPs_modern_filter_90.recode.vcf \
+--thin 1000 \
+--recode \
+--recode-INFO-all \
+--out SNPs_modern_filter_hwe_90_thin
+
+#coverage per individual
+vcftools --gzvcf SNPs_modern_filter_90_thin.recode.vcf \
+--depth \
+--out SNPs_modern_filter_hwe_90_thin
+
+#% missing data, loci per individual
+vcftools --gzvcf SNPs_
+modern_filter_90_thin.recode.vcf \
+--missing-indv 
+
